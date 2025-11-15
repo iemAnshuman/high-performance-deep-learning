@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Environments
+.env
+venv/
+.conda/
+
+# IDEs
+.vscode/
+.idea/
+
+# Data & Models (Never commit these!)
+*.pt
+*.pth
+*.bin
+*.csv
+datasets/
+
+# Profiling outputs
+*.ncu-rep

@@ -1,0 +1,12 @@
+torch>=2.1.0
+triton>=2.1.0
+numpy
+pandas
+matplotlib
+psycopg2-binary
+faker
+datasets
+transformers
+auto-gptq
+accelerate
+scipy
