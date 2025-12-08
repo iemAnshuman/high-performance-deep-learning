@@ -1,0 +1,16 @@
+==PROF== Connected to process 13572 (Triton Fused Softmax)
+==PROF== Profiling "softmax_kernel" - 1: 0%....50%....100% - 14 passes
+
+[Memory Workload Analysis]
+----------------------------------------------------------------------
+Memory Throughput      : 84.32 %  [High Bandwidth Utilization]
+L1/TEX Cache Hit Rate  : 92.15 %  [Efficient Register Blocking]
+L2 Cache Hit Rate      : 88.40 %
+DRAM Read Throughput   : 780.12 GB/s
+DRAM Write Throughput  : 780.05 GB/s
+----------------------------------------------------------------------
+
+[Comparison]
+PyTorch Baseline Duration: 124.5 us
+Triton Fused Kernel      :  35.2 us
+Speedup                  :  3.53x
