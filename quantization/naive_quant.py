@@ -2,75 +2,84 @@ import torch
 
 class Quantizer:
     """
-    Reference implementation for affine quantization. 
-    Used to verify Triton kernels later.
+    Affine Quantization Reference Implementation.
+    
+    Theory:
+        Quantization maps a floating point value \( x \in [x_{min}, x_{max}] \) to 
+        an integer \( q \in [0, 2^b-1] \) (asymmetric) or \([-2^{b-1}, 2^{b-1}-1]\) (symmetric).
+        
+        Formula:
+            $$ q = \text{clamp}(\text{round}(x / S + Z), q_{min}, q_{max}) $$
+            $$ x_{dequant} = (q - Z) * S $$
+        
+    Args:
+        bits (int): Bit-width (e.g., 8, 4).
+        symmetric (bool): If True, maps 0.0 float to 0 int (Scale-only).
+                          If False, uses Zero-Point (Scale + Shift).
     """
     def __init__(self, bits=8, symmetric=True):
         self.bits = bits
         self.symmetric = symmetric
-        self.qmin = -2**(bits - 1) if symmetric else 0
-        self.qmax = 2**(bits - 1) - 1 if symmetric else 2**bits - 1
+        if symmetric:
+            self.qmin = -2**(bits - 1)
+            self.qmax = 2**(bits - 1) - 1
+        else:
+            self.qmin = 0
+            self.qmax = 2**bits - 1
 
     def calibrate(self, x):
         """
-        Calculate scale and zero-point. 
-        Note: We force 0.0 to be exactly representable to preserve sparsity.
+        Computes quantization parameters (Scale and Zero-Point).
         """
         if self.symmetric:
-            # For symmetric, we pin zero_point to 0. 
-            # This simplifies the matmul logic significantly (no cross-terms).
+            # Symmetric: Centered on 0. Used for Weights.
+            # Range: [-max(|x|), max(|x|)]
             max_val = torch.max(torch.abs(x))
-            scale = max_val / (2**(self.bits - 1) - 1)
+            # Protect against divide-by-zero
+            scale = max_val / (2**(self.bits - 1) - 1 + 1e-8)
             zero_point = 0
         else:
+            # Asymmetric: Uses min/max. Used for Activations (e.g. ReLU output).
             min_val, max_val = torch.min(x), torch.max(x)
-            
-            # Use small epsilon to avoid div-by-zero on constant tensors
-            scale = (max_val - min_val) / (self.qmax - self.qmin + 1e-6)
-            
+            scale = (max_val - min_val) / (self.qmax - self.qmin + 1e-8)
             zero_point = self.qmin - min_val / scale
             zero_point = torch.round(zero_point).clamp(self.qmin, self.qmax)
         
         return scale, int(zero_point)
 
     def quantize(self, x, scale, zero_point):
-        # Affine quantization: x_int = round(x / S + Z)
+        """
+        Projects float32 tensor to quantized integer domain.
+        """
         q_x = x / scale + zero_point
         q_x = torch.round(q_x).clamp(self.qmin, self.qmax)
-        return q_x.to(torch.int8)
+        
+        # Simulating INT8 storage using float container for PyTorch operations
+        return q_x
 
     def dequantize(self, q_x, scale, zero_point):
-        # x_float = (x_int - Z) * S
-        return (q_x.float() - zero_point) * scale
+        """
+        Recovers approximation of original float32 tensor.
+        """
+        return (q_x - zero_point) * scale
 
 if __name__ == "__main__":
-    torch.manual_seed(0)
-    
-    # 1. Generate random data with outliers to test robustness
+    torch.manual_seed(42)
+    # Verification Routine
+    print("--- Quantization Precision Check ---")
     x = torch.randn(1024) * 10.0
-    x[0] = 50.0 # Force an outlier
+    x[0] = 50.0 # Introduce outlier
     
-    # 2. Test Symmetric (Intended for weights)
-    quantizer = Quantizer(bits=8, symmetric=True)
-    scale, zp = quantizer.calibrate(x)
+    # Weights Check (Symmetric)
+    q_sym = Quantizer(bits=8, symmetric=True)
+    s, z = q_sym.calibrate(x)
+    dx = q_sym.dequantize(q_sym.quantize(x, s, z), s, z)
+    mse_sym = torch.mean((x - dx)**2)
+    print(f"Symmetric (8-bit) MSE : {mse_sym:.6f}")
     
-    q_x = quantizer.quantize(x, scale, zp)
-    d_x = quantizer.dequantize(q_x, scale, zp)
-    
-    mse = torch.mean((x - d_x)**2)
-    print(f"[Symmetric] Scale: {scale:.4f}, ZP: {zp}")
-    print(f"[Symmetric] MSE: {mse:.6f}")
-
-    # 3. Test Asymmetric (Intended for activations)
-    quantizer = Quantizer(bits=8, symmetric=False)
-    scale, zp = quantizer.calibrate(x)
-    
-    q_x = quantizer.quantize(x, scale, zp)
-    d_x = quantizer.dequantize(q_x, scale, zp)
-    
-    mse = torch.mean((x - d_x)**2)
-    print(f"[Asymmetric] Scale: {scale:.4f}, ZP: {zp}")
-    print(f"[Asymmetric] MSE: {mse:.6f}")
-    
-    # Sanity check: Symmetric usually has higher error on asymmetric distributions (like ReLU output), 
-    # but here data is gaussian centered at 0, so they should be close.
+    # Activations Check (Asymmetric)
+    q_asym = Quantizer(bits=8, symmetric=False)
+    s, z = q_asym.calibrate(x)
+    dx = q_asym.dequantize(q_asym.quantize(x, s, z), s, z)
+    mse_asym = torch.mean((x - dx)**2)
+    print(f"Asymmetric (8-bit) MSE: {mse_asym:.6f}")
