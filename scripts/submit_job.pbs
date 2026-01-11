@@ -1,0 +1,53 @@
+#!/bin/bash
+
+# 1. Job Name 
+#PBS -N triton_158_train
+
+# 2. Resource Request
+# We ask for 4 "chunks" (nodes).
+# Each node must have 8 CPUs (ppn) and 1 GPU.
+#PBS -l nodes=4:ppn=8:gpus=1
+
+# 3. Walltime (Max runtime)
+# overestimating this. If the job hits this limit, it's killed instantly.
+#PBS -l walltime=48:00:00
+
+# 4. Queue Selection
+# 'gpu' is a standard queue name (confirm this)
+#PBS -q gpu
+
+# 5. Output Logging
+# Join stdout and stderr into one file for easier debugging
+#PBS -j oe
+#PBS -o logs/training_run_${PBS_JOBID}.log
+
+# Execution Logic:-
+
+# PBS scripts start in the user's home dir, not the submission dir.
+# We must cd to where the code is.
+cd $PBS_O_WORKDIR
+
+echo "[Start] Job started on node: $(hostname)"
+echo "[Start] Date: $(date)"
+echo "[Info] Allocated Nodes:"
+cat $PBS_NODEFILE
+
+# 1. Load Environment
+# University clusters usually use 'modules'
+echo "[Setup] Loading CUDA module..."
+module load cuda/12.1
+module load python/3.10
+
+# Activate virtual environment
+source venv/bin/activate
+
+# 2. Distributed Launch
+# In PBS, we have to construct the host list manually or trust the MPI launcher.
+# We'll use 'mpirun' which usually reads $PBS_NODEFILE automatically.
+
+echo "[Run] Launching Ring-AllReduce Training..."
+
+# -np 4 = Number of Processes (matches our node count)
+mpirun -np 4 python distributed/ring_reduce.cpp
+
+echo "[End] Job finished at: $(date)"
