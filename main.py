@@ -4,6 +4,11 @@ import shutil
 import argparse
 import torch
 import torch.nn as nn
+import warnings
+
+# Suppress the specific mmap warning from PyTorch
+warnings.filterwarnings("ignore", message="The given buffer is not writable")
+
 from transformers import AutoModelForCausalLM, AutoConfig
 
 # --- Project Imports ---
@@ -35,6 +40,7 @@ def print_header(msg):
 
 def setup_distributed():
     if not torch.distributed.is_initialized():
+        # Use localhost for single-node demo
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
         os.environ['RANK'] = '0'
@@ -52,7 +58,6 @@ def run_training_phase(model_name):
     print(f"⏳ Loading model structure for '{model_name}'...")
     try:
         config = AutoConfig.from_pretrained(model_name)
-        # Using empty weights to save download time for the demo
         model = AutoModelForCausalLM.from_config(config).to(device)
     except Exception as e:
         print(f"❌ Failed: {e}")
@@ -63,12 +68,10 @@ def run_training_phase(model_name):
     # 1. Apply Triton Kernels (Replacing PyTorch Layers)
     if HAS_TRITON and device == 'cuda':
         print("🚀 Injecting Triton Fused Kernels...")
-        # (In a real scenario, we'd monkey-patch the model's MLP activation)
-        # Here we demonstrate the kernel execution on a dummy pass
+        # Demonstration of kernel execution
         dummy_input = torch.randn(32, 4096, device='cuda')
         dummy_bias = torch.randn(32, 4096, device='cuda')
         
-        # Benchmarking Triton vs PyTorch
         start = time.time()
         _ = fused_mlp(dummy_input, dummy_bias)
         torch.cuda.synchronize()
@@ -85,14 +88,15 @@ def run_training_phase(model_name):
     vocab_size = getattr(config, 'vocab_size', 32000)
     inputs = torch.randint(0, vocab_size, (1, 64)).to(device)
     
-    # FIX: Pass labels so the model calculates loss internally
+    # [FIX] Pass 'labels' so the model calculates loss internally.
+    # Hugging Face models return None for loss if labels are missing.
     outputs = ddp_model(inputs, labels=inputs)
     
-    # FIX: Robust check for None loss (HuggingFace outputs.loss is None if labels aren't passed)
+    # [FIX] Robust check for loss existence
     if hasattr(outputs, 'loss') and outputs.loss is not None:
         loss = outputs.loss
     else:
-        # Fallback if no labels were passed
+        # Fallback if specific model doesn't compute loss automatically
         loss = outputs.logits.mean()
 
     loss.backward()
@@ -117,11 +121,20 @@ def run_quantization_phase(model):
     print(f"📂 Saving to: ./{output_dir}/")
     layer_count = 0
     
-    # We only quantize the first 5 layers for the demo to be fast
+    # [FIX] GPT-2 uses 'Conv1D' layers, not just nn.Linear.
+    # We detect them by class name to avoid importing internal transformers modules.
     for i, (name, module) in enumerate(model.named_modules()):
-        if isinstance(module, nn.Linear):
-            # FIX: Move to CPU before passing to C++ to avoid Segfault
+        is_linear = isinstance(module, nn.Linear)
+        is_conv1d = (module.__class__.__name__ == 'Conv1D')
+        
+        if is_linear or is_conv1d:
+            # Move to CPU to avoid CUDA OOM during quantization loop
             w = module.weight.data.detach().float().cpu()
+            
+            # [Optimization] Ensure even number of elements for packing (nibbles)
+            if w.numel() % 2 != 0:
+                # Pad with one zero if odd (rare for standard layers)
+                w = torch.cat([w.view(-1), torch.zeros(1)])
             
             # Quantize
             w_min, w_max = w.min(), w.max()
@@ -131,7 +144,12 @@ def run_quantization_phase(model):
             # Pack
             mid = w_int.numel() // 2
             w_flat = w_int.view(-1)
-            packed = quantization_cpp.pack_int4(w_flat[:mid].contiguous(), w_flat[mid:mid*2].contiguous())
+            
+            # Use C++ extension to pack 2 uint8s into 1 uint8
+            packed = quantization_cpp.pack_int4(
+                w_flat[:mid].contiguous(), 
+                w_flat[mid:mid*2].contiguous()
+            )
             
             # Save
             fname = os.path.join(output_dir, f"{name.replace('.', '_')}.bin")
@@ -139,7 +157,7 @@ def run_quantization_phase(model):
                 f.write(packed.numpy().tobytes())
             
             layer_count += 1
-            print(f"   🔹 Compressed {name}")
+            print(f"   🔹 Compressed {name} ({'Linear' if is_linear else 'Conv1D'})")
             
             if layer_count >= 5: 
                 print("   (Stopping at 5 layers for demo speed)")
@@ -163,6 +181,7 @@ def run_inference_phase(quantized_dir):
     
     # 1. Load (Instant)
     loader = ZeroCopyLoader(target_file)
+    # Map file to memory
     loaded_tensor = loader.load_tensor(offset=0, shape=(file_size,), dtype=torch.uint8)
     print(f"✅ Mapped File: {target_file} ({file_size/1024:.1f} KB)")
     
@@ -172,8 +191,13 @@ def run_inference_phase(quantized_dir):
         full = torch.cat([a, b], dim=0).to(get_device()).float()
         
         # 3. Compute
-        res = torch.matmul(full, torch.randn(full.shape[1], 1, device=get_device()))
-        print(f"🚀 Inference Computed on {get_device().upper()}")
+        # [FIX] 'full' is a flattened 1D tensor here (metadata lost in demo).
+        # We use a dot product with a random vector of the SAME size to verify computation works.
+        # Previous code crashed because it assumed 2 dimensions.
+        dummy_vec = torch.randn(full.shape[0], device=get_device())
+        res = torch.dot(full, dummy_vec)
+        
+        print(f"🚀 Inference Computed on {get_device().upper()} (Result: {res.item():.2f})")
 
     loader.close()
 
@@ -187,19 +211,22 @@ if __name__ == "__main__":
 
     model_name = args.model
     if model_name == "gpt2":
-        # Allow non-interactive mode for automated testing
         try:
             user_input = input(f"Enter model name (Press Enter for '{model_name}'): ")
             if user_input.strip(): model_name = user_input.strip()
         except EOFError:
             pass
 
-    model = run_training_phase(model_name)
-    if model:
-        q_dir = run_quantization_phase(model)
-        run_inference_phase(q_dir)
-        
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    # [FIX] Wrap in try...finally to ensure DDP cleanup happens even if code crashes
+    try:
+        model = run_training_phase(model_name)
+        if model:
+            q_dir = run_quantization_phase(model)
+            run_inference_phase(q_dir)
+            
+    finally:
+        if torch.distributed.is_initialized():
+            print("🧹 Cleaning up process group...")
+            torch.distributed.destroy_process_group()
     
     print("\n✅ Optimization Pipeline Complete.")
