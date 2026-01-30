@@ -2,9 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-# We inline the GeLU logic to prevent JIT linker errors
-# GeLU Approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-
+# --- The Autotuner ---
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_SIZE': 128}, num_warps=2),
@@ -39,13 +37,14 @@ def fused_mlp_kernel(
     # 2. Fused Compute in Registers
     accum = x + bias
     
-    # Inline GeLU Approximation for stability
+    # Inline GeLU Approximation
     # k = sqrt(2/pi) ~= 0.7978845608
     # c = 0.044715
-    
     accum_cubed = accum * accum * accum
     inner = 0.7978845608 * (accum + 0.044715 * accum_cubed)
-    output = 0.5 * accum * (1.0 + tl.tanh(inner))
+    
+    # FIX: Use tl.math.tanh instead of tl.tanh
+    output = 0.5 * accum * (1.0 + tl.math.tanh(inner))
     
     # 3. Store result
     tl.store(out_ptr + offsets, output, mask=mask)
@@ -62,3 +61,25 @@ def fused_mlp(x: torch.Tensor, bias: torch.Tensor):
     fused_mlp_kernel[grid](x, bias, output, n_elements)
     
     return output
+
+if __name__ == "__main__":
+    if not torch.cuda.is_available():
+        print("Skipping: No CUDA device found.")
+    else:
+        # Correctness Check
+        x = torch.randn(4096 * 4096, device='cuda')
+        bias = torch.randn(4096 * 4096, device='cuda')
+        
+        # This first run triggers the autotuner
+        triton_out = fused_mlp(x, bias)
+        
+        # Reference implementation
+        torch_out = torch.nn.functional.gelu(x + bias, approximate='tanh')
+        
+        max_diff = torch.max(torch.abs(triton_out - torch_out))
+        print(f"Max Difference: {max_diff:.6f}")
+        
+        if torch.allclose(triton_out, torch_out, atol=1e-3):
+            print("Success! Fused MLP matches PyTorch approximation.")
+        else:
+            print("Mismatch! Precision error too high.")
