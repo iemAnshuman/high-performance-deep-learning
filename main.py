@@ -1,4 +1,8 @@
 import os
+
+# [FIX] Silence TensorFlow/XLA logs before any libraries are imported
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
+
 import time
 import shutil
 import argparse
@@ -7,8 +11,9 @@ import warnings
 import torch
 import torch.nn as nn
 
-# Suppress mmap warnings
+# Suppress specific mmap and deprecation warnings
 warnings.filterwarnings("ignore", message="The given buffer is not writable")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from transformers import AutoModelForCausalLM, AutoConfig
 
@@ -18,7 +23,7 @@ try:
     HAS_CPP_EXT = True
 except ImportError:
     HAS_CPP_EXT = False
-    print("⚠️  Warning: 'quantization_cpp' not found. Run 'pip install -e .' first.")
+    print("Warning: 'quantization_cpp' not found. Run 'pip install -e .' first.")
 
 from distributed.manual_ddp import BucketedDDP
 from inference.mmap_loader import ZeroCopyLoader
@@ -30,9 +35,7 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-# -------------------------------------------------------------------------
 # Utils
-# -------------------------------------------------------------------------
 def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -48,42 +51,44 @@ def setup_distributed():
         backend = 'nccl' if torch.cuda.is_available() else 'gloo'
         torch.distributed.init_process_group(backend=backend)
 
-# -------------------------------------------------------------------------
 # Phase 1: GPU Fine-Tuning
-# -------------------------------------------------------------------------
 def run_training_phase(model_name):
     print_header(f"Phase 1: GPU Optimization & Training '{model_name}'")
     device = get_device()
     
-    print(f"⏳ Loading model structure for '{model_name}'...")
+    print(f"Loading model structure for '{model_name}'...")
     try:
         config = AutoConfig.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_config(config).to(device)
     except Exception as e:
-        print(f"❌ Failed: {e}")
+        print(f"Failed: {e}")
         return None
 
-    print(f"✅ Model Loaded on {device.upper()}")
+    print(f"Model Loaded on {device.upper()}")
 
+    # 1. Triton Kernel Benchmark
     if HAS_TRITON and device == 'cuda':
-        print("🚀 Injecting Triton Fused Kernels...")
+        print("🚀 Benchmarking Triton Fused Kernels...")
         dummy_input = torch.randn(32, 4096, device='cuda')
         dummy_bias = torch.randn(32, 4096, device='cuda')
+        
         start = time.time()
         _ = fused_mlp(dummy_input, dummy_bias)
         torch.cuda.synchronize()
         print(f"   Triton Fused MLP Time: {(time.time() - start)*1000:.3f} ms")
 
+    # 2. Distributed Wrapper
     setup_distributed()
     ddp_model = BucketedDDP(model, bucket_cap_mb=25)
-    print("✅ Wrapped in BucketedDDP")
+    print("Wrapped in BucketedDDP")
 
-    print("🔄 Running Backward Pass...")
+    # 3. Training Step
+    print("Running Backward Pass...")
     model.train()
     vocab_size = getattr(config, 'vocab_size', 32000)
     inputs = torch.randint(0, vocab_size, (1, 64)).to(device)
     
-    # Hugging Face models need labels to calculate loss
+    # Pass labels so Hugging Face models calculate loss internally
     outputs = ddp_model(inputs, labels=inputs)
     
     if hasattr(outputs, 'loss') and outputs.loss is not None:
@@ -92,24 +97,22 @@ def run_training_phase(model_name):
         loss = outputs.logits.mean()
 
     loss.backward()
-    print(f"✅ Gradients Synchronized. Loss: {loss.item():.4f}")
+    print(f"Gradients Synchronized. Loss: {loss.item():.4f}")
     return model
 
-# -------------------------------------------------------------------------
-# Phase 2: INT4 Quantization (With Semantic Metadata)
-# -------------------------------------------------------------------------
+# Phase 2: INT4 Quantization (With Metadata)
 def run_quantization_phase(model):
     print_header("Phase 2: INT4 Quantization Pipeline")
     
     if not HAS_CPP_EXT:
-        print("❌ C++ Extension missing.")
+        print("C++ Extension missing.")
         return None
 
     output_dir = "quantized_weights"
     if os.path.exists(output_dir): shutil.rmtree(output_dir)
     os.makedirs(output_dir)
     
-    print(f"📂 Saving to: ./{output_dir}/")
+    print(f"Saving to: ./{output_dir}/")
     layer_count = 0
     
     for i, (name, module) in enumerate(model.named_modules()):
@@ -121,13 +124,13 @@ def run_quantization_phase(model):
             w = module.weight.data.detach().float().cpu()
             original_shape = list(w.shape)
             
-            # Padding for odd-sized tensors
+            # Padding for odd-sized tensors (rare but possible)
             padding = 0
             if w.numel() % 2 != 0:
                 padding = 1
                 w = torch.cat([w.view(-1), torch.zeros(1)])
             
-            # Quantize
+            # Quantization
             w_min, w_max = w.min(), w.max()
             scale = (w_max - w_min) / 15.0
             if scale == 0: scale = 1.0
@@ -148,7 +151,7 @@ def run_quantization_phase(model):
             with open(bin_path, "wb") as f:
                 f.write(packed.numpy().tobytes())
 
-            # [FIX] Save 'is_conv1d' so inference knows how to multiply
+            # Save Metadata for Dequantization & Inference direction
             meta_path = os.path.join(output_dir, f"{safe_name}.json")
             metadata = {
                 "shape": original_shape,
@@ -161,7 +164,7 @@ def run_quantization_phase(model):
                 json.dump(metadata, f)
             
             layer_count += 1
-            print(f"   🔹 Compressed {name}")
+            print(f"   Compressed {name}")
             
             if layer_count >= 5: 
                 print("   (Stopping at 5 layers for demo speed)")
@@ -169,9 +172,7 @@ def run_quantization_phase(model):
 
     return output_dir
 
-# -------------------------------------------------------------------------
-# Phase 3: Zero-Copy Inference (Semantically Correct)
-# -------------------------------------------------------------------------
+# Phase 3: Zero-Copy Inference (Direction Correct)
 def run_inference_phase(quantized_dir):
     print_header("Phase 3: Zero-Copy Inference (Virtual Memory)")
     
@@ -180,8 +181,6 @@ def run_inference_phase(quantized_dir):
     files = [f for f in os.listdir(quantized_dir) if f.endswith('.bin')]
     if not files: return
     
-    # Pick the last file usually to avoid picking small attn layers, 
-    # but for stability just pick the first one found.
     bin_file = files[0]
     meta_file = bin_file.replace('.bin', '.json')
     
@@ -189,7 +188,7 @@ def run_inference_phase(quantized_dir):
     target_meta = os.path.join(quantized_dir, meta_file)
     
     if not os.path.exists(target_meta):
-        print("❌ Metadata missing.")
+        print("Metadata missing.")
         return
 
     # Load Metadata
@@ -202,7 +201,7 @@ def run_inference_phase(quantized_dir):
     try:
         # 1. Map
         loaded_tensor = loader.load_tensor(offset=0, shape=(file_size,), dtype=torch.uint8)
-        print(f"✅ Mapped File: {target_bin} ({file_size/1024:.1f} KB)")
+        print(f"Mapped File: {target_bin} ({file_size/1024:.1f} KB)")
         
         # 2. Unpack & Dequantize
         if HAS_CPP_EXT:
@@ -220,36 +219,27 @@ def run_inference_phase(quantized_dir):
             print(f"   Restored Matrix Shape: {list(w_recon.shape)}")
             
             # 3. Compute (Direction Aware)
-            # [FIX] Check layer type to perform correct Matrix Multiplication
+            # Correct matrix multiplication based on layer type
             if meta.get('is_conv1d', False):
-                # Conv1D weights are [In, Out]
-                # Forward Pass: Input(1, In) @ Weight(In, Out) -> Output(1, Out)
+                # Conv1D weights are [In, Out]. Forward is Input @ Weight
                 input_dim = w_recon.shape[0]
-                output_dim = w_recon.shape[1]
                 dummy_input = torch.randn(1, input_dim, device=device)
-                
                 res = torch.matmul(dummy_input, w_recon)
                 print(f"   Mode: Conv1D (Input @ Weight)")
             else:
-                # Linear weights are [Out, In]
-                # Forward Pass: Weight(Out, In) @ Input(In, 1) -> Output(Out, 1)
-                # (Or Input @ Weight.T)
+                # Linear weights are [Out, In]. Forward is Weight @ Input (or Input @ Weight.T)
                 input_dim = w_recon.shape[1]
-                output_dim = w_recon.shape[0]
                 dummy_input = torch.randn(input_dim, 1, device=device)
-                
                 res = torch.matmul(w_recon, dummy_input)
                 print(f"   Mode: Linear (Weight @ Input)")
 
-            print(f"🚀 Inference Computed on {device.upper()}")
+            print(f"Inference Computed on {device.upper()}")
             print(f"   Output Shape: {list(res.shape)} | Mean Value: {res.mean().item():.4f}")
 
     finally:
         loader.close()
 
-# -------------------------------------------------------------------------
 # Main
-# -------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="gpt2", help="HuggingFace Model ID")
@@ -274,4 +264,4 @@ if __name__ == "__main__":
             print("🧹 Cleaning up process group...")
             torch.distributed.destroy_process_group()
     
-    print("\n✅ Optimization Pipeline Complete.")
+    print("\nOptimization Pipeline Complete.")
