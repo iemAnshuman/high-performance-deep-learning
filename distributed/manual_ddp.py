@@ -12,69 +12,60 @@ class Bucket:
         self.max_bytes = buffer_size_mb * 1024 * 1024
         self.current_bytes = 0
         self.params = []      # List of (name, param)
-        self.ready_count = 0  # How many params in this bucket have gradients ready?
+        self.offsets = {}     # Map param -> (start, end) in buffer
+        self.ready_count = 0 
         self.device = device
-        
-        # We delay buffer allocation until we know exactly how big the bucket is
         self.buffer = None 
 
     def add_param(self, name, param):
         self.params.append((name, param))
-        self.current_bytes += param.numel() * param.element_size()
+        num_bytes = param.numel() * param.element_size()
+        
+        # Track offset for this param
+        start = self.current_bytes // 4 # float32 indices
+        end = start + param.numel()
+        self.offsets[param] = (start, end)
+        
+        self.current_bytes += num_bytes
 
     def is_full(self):
         return self.current_bytes >= self.max_bytes
 
     def finalize_buffer(self):
-        """Allocates the flat buffer once all params are assigned."""
         if self.current_bytes == 0:
             return
-            
-        # Create a flat tensor to hold all gradients in this bucket
+        # Create flat buffer
         self.buffer = torch.zeros(
-            self.current_bytes // 4, # Assuming float32 (4 bytes)
+            self.current_bytes // 4, 
             dtype=torch.float32, 
             device=self.device
         )
 
     def reset(self):
         self.ready_count = 0
-
+        self.buffer.zero_()
 
 class BucketedDDP(nn.Module):
-    """
-    Production-Grade DDP implementation with Gradient Bucketing.
-    
-    Architecture:
-    1. Group parameters into 25MB buckets (Reverse order).
-    2. During Backward: Copy individual grad -> Bucket Buffer.
-    3. When Bucket is full -> All-Reduce (One big network call).
-    4. Copy Bucket Buffer -> individual grad (for Optimizer).
-    """
     def __init__(self, model, bucket_cap_mb=25):
         super().__init__()
         self.model = model
-        self.bucket_cap_mb = bucket_cap_mb
         
         # 1. Setup Distributed
         if not dist.is_initialized():
-            raise RuntimeError("BucketedDDP requires torch.distributed to be initialized!")
+            raise RuntimeError("BucketedDDP requires torch.distributed!")
         
         self.rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
         self.device = next(model.parameters()).device
         
-        # 2. Assign Parameters to Buckets
-        # IMPORTANT: We iterate in REVERSE order because the backward pass 
-        # calculates gradients from Output -> Input. We want buckets to fill
-        # and sync immediately to overlap communication with compute.
+        # 2. Assign Parameters to Buckets (Reverse Order)
         self.buckets = []
         current_bucket = Bucket(0, bucket_cap_mb, self.device)
         
-        # Get all params requiring grad
+        # Filter only trainable params
         params = [p for p in model.named_parameters() if p[1].requires_grad]
         
         for name, param in reversed(params):
-            # If adding this param would overflow the bucket, close it and start new
             if current_bucket.is_full():
                 current_bucket.finalize_buffer()
                 self.buckets.append(current_bucket)
@@ -82,111 +73,63 @@ class BucketedDDP(nn.Module):
             
             current_bucket.add_param(name, param)
             
-            # Map param to its bucket for quick lookup in the hook
-            # We use the param object id as the key
             if not hasattr(self, 'param_to_bucket'):
                 self.param_to_bucket = {}
             self.param_to_bucket[param] = current_bucket
 
-        # Don't forget the last bucket
         if current_bucket.current_bytes > 0:
             current_bucket.finalize_buffer()
             self.buckets.append(current_bucket)
 
         # 3. Register Hooks
         self._register_hooks()
-        
-        if self.rank == 0:
-            print(f"[DDP] Initialized {len(self.buckets)} buckets for {len(params)} parameters.")
 
     def _register_hooks(self):
-        for name, param in self.model.named_parameters():
+        for param in self.model.parameters():
             if param.requires_grad:
-                # Retain grad ensures the grad tensor isn't freed immediately
-                param.retain_grad()
-                
-                # Register hook
+                # We do NOT use param.retain_grad() here necessarily, 
+                # but we rely on the hook argument.
                 def hook(grad, p=param):
                     self._on_grad_ready(p, grad)
                     return grad
-                
                 param.register_hook(hook)
 
     def _on_grad_ready(self, param, grad):
-        """
-        Called when a single parameter's gradient is calculated.
-        """
         bucket = self.param_to_bucket[param]
+        
+        # FIX: Copy gradient into buffer IMMEDIATELY using the stored offset
+        # We don't wait for _sync_bucket because 'grad' is transient
+        start, end = bucket.offsets[param]
+        bucket.buffer[start:end] = grad.view(-1)
+        
         bucket.ready_count += 1
         
-        # In a real implementation, we would copy 'grad' into 'bucket.buffer' here.
-        # For this demo, we assume the copy happens logically.
-        
-        # Check if this was the last parameter needed for this bucket
         if bucket.ready_count == len(bucket.params):
             self._sync_bucket(bucket)
 
     def _sync_bucket(self, bucket):
-        """
-        Trigger communication for the whole bucket.
-        """
-        # 1. Pack: Flatten all individual grads into the bucket buffer
-        offset = 0
-        for name, param in bucket.params:
-            numel = param.numel()
-            # Copy param.grad into the slice of the bucket buffer
-            bucket.buffer[offset : offset + numel] = param.grad.view(-1)
-            offset += numel
-            
-        # 2. Reduce: The expensive network call (Happens only once per bucket!)
-        # async_op=False ensures we wait for it to finish before unpacking
+        # 1. Reduce: The expensive network call
         dist.all_reduce(bucket.buffer, op=dist.ReduceOp.SUM)
         
-        # 3. Unpack: Copy synced data back to individual params so the Optimizer sees it
-        bucket.buffer.div_(dist.get_world_size()) # Average
+        # 2. Average
+        if self.world_size > 1:
+            bucket.buffer.div_(self.world_size)
         
-        offset = 0
+        # 3. Unpack: Write back to params
+        # Note: Since hooks for previous params already finished, we update 
+        # param.grad manually. This is a simplification for the demo.
         for name, param in bucket.params:
-            numel = param.numel()
-            # Write back
-            param.grad.copy_(bucket.buffer[offset : offset + numel].view(param.shape))
-            offset += numel
+            start, end = bucket.offsets[param]
+            synced_grad = bucket.buffer[start:end].view(param.shape)
             
-        # Reset for next iteration
+            # If param.grad is None (likely), we create it. 
+            # If it exists, we overwrite it.
+            if param.grad is None:
+                param.grad = synced_grad.clone()
+            else:
+                param.grad.copy_(synced_grad)
+            
         bucket.reset()
 
     def forward(self, *inputs, **kwargs):
         return self.model(*inputs, **kwargs)
-
-# Testing Sandbox
-if __name__ == "__main__":
-    import os
-    # Simulate a distributed run
-    # To run: torchrun --nproc_per_node=2 distributed/manual_ddp.py
-    
-    if "RANK" in os.environ:
-        dist.init_process_group(backend="gloo") # Gloo is fine for CPU testing
-        
-        # Create a dummy model
-        model = nn.Sequential(
-            nn.Linear(1024, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 10)
-        ).to("cpu") # Use CPU for local testing if no GPU
-        
-        ddp_model = BucketedDDP(model, bucket_cap_mb=1) # Small bucket for testing
-        
-        # Fake Step
-        input = torch.randn(32, 1024)
-        output = ddp_model(input)
-        loss = output.sum()
-        
-        # Triggers hooks -> Triggers Bucket Sync
-        loss.backward()
-        
-        if dist.get_rank() == 0:
-            print("Backward pass complete. Gradients synchronized via buckets.")
-        
-        dist.destroy_process_group()
-    else:
-        print("Run with torchrun to test distributed logic.")

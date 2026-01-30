@@ -10,7 +10,7 @@
 
 A high-performance library implementing custom **OpenAI Triton kernels**, **Low-Precision Quantization schemes**, and **Distributed Communication primitives**. 
 
-This project benchmarks the theoretical limits of consumer GPUs (e.g., RTX 3090/4090) against Datacenter behavior, specifically analyzing **Memory Bandwidth bottlenecks (HBM)** and **Warp Divergence** in Llama-architecture workloads.
+This project benchmarks the theoretical limits of hardware accelerators against Datacenter behavior, specifically analyzing **Memory Bandwidth bottlenecks (HBM)** and **Warp Divergence** in Llama-architecture workloads.
 
 ---
 
@@ -19,19 +19,19 @@ This project benchmarks the theoretical limits of consumer GPUs (e.g., RTX 3090/
 ### 1. Kernel Fusion & Optimization (Triton)
 Standard PyTorch eager execution suffers from excessive HBM round-trips. I implemented custom fused kernels to keep data in SRAM/Registers.
 
-- **Fused Softmax (Safe):** Optimized block reduction using online normalization to prevent FP16 overflow.
+- **Fused Softmax:** Optimized block reduction using online normalization to prevent FP16 overflow.
 - **Fused MLP:** GeLU approximation fused with bias addition to minimize activation materialization.
 - **Result:** Achieved **3.53x speedup** over PyTorch `torch.nn.functional.softmax` on large matrices (see `kernels/assets/profiling_summary.txt`).
 
 ### 2. Distributed Training Primitives (C++ / MPI)
 Understanding the physics of multi-node communication is critical for 70B+ models.
-- **Ring All-Reduce:** Implemented the classic bandwidth-optimal synchronization algorithm using raw MPI blocking calls (`MPI_Send`/`MPI_Recv`) to visualize the gradient flow.
-- **Tensor Parallelism:** Custom `ColumnParallelLinear` layers to shard massive weight matrices across multiple GPUs for inference.
+- **Ring All-Reduce:** Implemented the classic bandwidth-optimal synchronization algorithm using raw MPI blocking calls (`MPI_Send`/`MPI_Recv`) to visualize gradient flow.
+- **Gradient Bucketing:** Custom DDP wrapper that aggregates gradients into optimal 25MB chunks, hiding network latency during the backward pass.
 
-### 3. Edge Efficiency & Quantization
-Making Large Language Models (LLMs) accessible on constrained hardware.
-- **Zero-Copy Loading:** Implemented `mmap` based loading to map model weights directly from disk to virtual memory, bypassing CPU RAM copies.
-- **Neuro-Shrink:** A CLI tool to calculate exact VRAM requirements (including KV Cache overhead) for arbitrary transformer architectures.
+### 3. Systems-Level Quantization (C++)
+Bypassing the Python interpreter for high-throughput compression.
+- **C++ Bit Packing:** A custom PyTorch C++ extension to pack/unpack INT4 weights instantly, reducing memory footprint by 8x compared to FP32.
+- **Zero-Copy Inference:** Implemented `mmap`-based loading to map model weights directly from disk to virtual memory, enabling 70B+ model inference on consumer hardware (e.g., RTX 3090/4090) with limited VRAM.
 
 ---
 
@@ -39,13 +39,13 @@ Making Large Language Models (LLMs) accessible on constrained hardware.
 
 I conducted a Roofline Analysis to determine if my kernels were Compute Bound or Memory Bound.
 
-| Kernel Operation | Arithmetic Intensity | Throughput (GB/s) | Bottleneck |
-| :--- | :--- | :--- | :--- |
-| **Vector Add** | 0.08 FLOPs/Byte | 780.12 | **Memory (HBM)** |
-| **MatMul (4096²)** | 682.67 FLOPs/Byte | - | **Compute (Tensor Core)** |
-| **Fused Softmax** | High | **84.3% of Peak** | **L2 Cache / SRAM** |
+| Kernel Operation | Arithmetic Intensity | Bottleneck |
+| :--- | :--- | :--- |
+| **Vector Add** | 0.08 FLOPs/Byte | **Memory (HBM)** |
+| **MatMul (4096²)** | 682.67 FLOPs/Byte | **Compute (Tensor Core)** |
+| **Fused Softmax** | High | **L2 Cache / SRAM** |
 
-*Artifact: Generated via `benchmarks/roofline.ipynb` on NVIDIA T4.*
+*Artifact: Generated via `benchmarks/roofline.ipynb`.*
 
 ---
 
@@ -59,24 +59,21 @@ This project requires a Linux environment with an NVIDIA GPU (Ampere or newer re
 git clone [https://github.com/iemAnshuman/high-performance-deep-learning.git](https://github.com/iemAnshuman/high-performance-deep-learning.git)
 cd high-performance-deep-learning
 
-# 2. Install dependencies (Virtual Env recommended)
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+# 2. Compile C++ Extensions (MPI Ring & Quantization)
+pip install -e . --no-build-isolation
 
 ```
 
-### Running the Distributed Simulation
+### Running the End-to-End Pipeline
 
-To visualize the Ring All-Reduce gradient synchronization (requires `openmpi`):
+We provide a demo script that simulates Training (Phase 1), Compression (Phase 2), and Inference (Phase 3).
 
 ```bash
-make run_ring
-# Output:
-# [Process 0] Rank 0: Completed Step 1/3
-# [Process 1] Rank 1: Completed Step 1/3 ...
+python demo_pipeline.py
 
 ```
+
+*Note: On systems without CUDA, the pipeline automatically falls back to CPU simulation mode for logic verification.*
 
 ### Verifying Triton Kernels
 
@@ -94,17 +91,22 @@ pytest tests/
 ```text
 ├── distributed/
 │   ├── ring_reduce.cpp       # MPI implementation of Ring All-Reduce
-│   ├── manual_ddp.py         # Custom DistributedDataParallel with Hooks
+│   ├── manual_ddp.py         # Custom DDP with Gradient Bucketing
 │   └── tensor_parallel.py    # Column/Row Linear Layers for 70B inference
 ├── kernels/
 │   ├── fused_softmax.py      # Triton kernel for memory-efficient Softmax
-│   ├── fused_mlp.py          # Triton kernel for GeLU + Add
+│   ├── fused_mlp.py          # Triton kernel for GeLU + Add w/ Autotuning
 │   └── vector_add.py         # Baseline bandwidth test
-├── scientific/
-│   └── triton_monte_carlo.py # Parallel RNG for Pi estimation (Physics demo)
-├── tools/
-│   └── neuro_shrink.py       # VRAM calculator for LLM deployment
+├── quantization/
+│   ├── cpp_packing.cpp       # C++ Extension for INT4 Bit-Packing
+│   └── naive_quant.py        # Python reference implementation
+├── inference/
+│   └── mmap_loader.py        # Zero-Copy Loader using OS Page Cache
 └── docs/
-    └── RESEARCH_LOG.md       # Engineering log of failed experiments & fixes
+    └── RESEARCH_LOG.md       # Engineering log of experiments & trade-offs
 
 ```
+
+## Acknowledgements
+
+* **OpenAI Triton Team** for the blocked algorithms tutorial.
