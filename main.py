@@ -85,8 +85,16 @@ def run_training_phase(model_name):
     vocab_size = getattr(config, 'vocab_size', 32000)
     inputs = torch.randint(0, vocab_size, (1, 64)).to(device)
     
-    outputs = ddp_model(inputs)
-    loss = outputs.loss if hasattr(outputs, 'loss') else outputs.logits.mean()
+    # FIX: Pass labels so the model calculates loss internally
+    outputs = ddp_model(inputs, labels=inputs)
+    
+    # FIX: Robust check for None loss (HuggingFace outputs.loss is None if labels aren't passed)
+    if hasattr(outputs, 'loss') and outputs.loss is not None:
+        loss = outputs.loss
+    else:
+        # Fallback if no labels were passed
+        loss = outputs.logits.mean()
+
     loss.backward()
     
     print(f"✅ Gradients Synchronized. Loss: {loss.item():.4f}")
@@ -179,8 +187,12 @@ if __name__ == "__main__":
 
     model_name = args.model
     if model_name == "gpt2":
-        user_input = input(f"Enter model name (Press Enter for '{model_name}'): ")
-        if user_input.strip(): model_name = user_input.strip()
+        # Allow non-interactive mode for automated testing
+        try:
+            user_input = input(f"Enter model name (Press Enter for '{model_name}'): ")
+            if user_input.strip(): model_name = user_input.strip()
+        except EOFError:
+            pass
 
     model = run_training_phase(model_name)
     if model:
