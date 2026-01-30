@@ -3,12 +3,11 @@ import time
 import shutil
 import argparse
 import json
-import struct
 import warnings
 import torch
 import torch.nn as nn
 
-# Suppress specific mmap warning
+# Suppress mmap warnings
 warnings.filterwarnings("ignore", message="The given buffer is not writable")
 
 from transformers import AutoModelForCausalLM, AutoConfig
@@ -84,6 +83,7 @@ def run_training_phase(model_name):
     vocab_size = getattr(config, 'vocab_size', 32000)
     inputs = torch.randint(0, vocab_size, (1, 64)).to(device)
     
+    # Hugging Face models need labels to calculate loss
     outputs = ddp_model(inputs, labels=inputs)
     
     if hasattr(outputs, 'loss') and outputs.loss is not None:
@@ -96,7 +96,7 @@ def run_training_phase(model_name):
     return model
 
 # -------------------------------------------------------------------------
-# Phase 2: INT4 Quantization (With Metadata)
+# Phase 2: INT4 Quantization (With Semantic Metadata)
 # -------------------------------------------------------------------------
 def run_quantization_phase(model):
     print_header("Phase 2: INT4 Quantization Pipeline")
@@ -114,6 +114,7 @@ def run_quantization_phase(model):
     
     for i, (name, module) in enumerate(model.named_modules()):
         is_linear = isinstance(module, nn.Linear)
+        # GPT-2 uses Conv1D which stores weights as [in, out]
         is_conv1d = (module.__class__.__name__ == 'Conv1D')
         
         if is_linear or is_conv1d:
@@ -126,14 +127,14 @@ def run_quantization_phase(model):
                 padding = 1
                 w = torch.cat([w.view(-1), torch.zeros(1)])
             
-            # Quantization
+            # Quantize
             w_min, w_max = w.min(), w.max()
             scale = (w_max - w_min) / 15.0
-            if scale == 0: scale = 1.0 # Handle constant weights
+            if scale == 0: scale = 1.0
             
             w_int = ((w - w_min) / (scale + 1e-8)).round().clamp(0, 15).to(torch.uint8)
             
-            # Packing
+            # Pack
             mid = w_int.numel() // 2
             w_flat = w_int.view(-1)
             packed = quantization_cpp.pack_int4(
@@ -147,13 +148,14 @@ def run_quantization_phase(model):
             with open(bin_path, "wb") as f:
                 f.write(packed.numpy().tobytes())
 
-            # [FIX] Save Metadata for reconstruction
+            # [FIX] Save 'is_conv1d' so inference knows how to multiply
             meta_path = os.path.join(output_dir, f"{safe_name}.json")
             metadata = {
                 "shape": original_shape,
                 "min": float(w_min),
                 "scale": float(scale),
-                "padding": padding
+                "padding": padding,
+                "is_conv1d": is_conv1d
             }
             with open(meta_path, "w") as f:
                 json.dump(metadata, f)
@@ -168,17 +170,18 @@ def run_quantization_phase(model):
     return output_dir
 
 # -------------------------------------------------------------------------
-# Phase 3: Zero-Copy Inference (Correct Dequantization)
+# Phase 3: Zero-Copy Inference (Semantically Correct)
 # -------------------------------------------------------------------------
 def run_inference_phase(quantized_dir):
     print_header("Phase 3: Zero-Copy Inference (Virtual Memory)")
     
     if not quantized_dir: return
 
-    # Find first bin file
     files = [f for f in os.listdir(quantized_dir) if f.endswith('.bin')]
     if not files: return
     
+    # Pick the last file usually to avoid picking small attn layers, 
+    # but for stability just pick the first one found.
     bin_file = files[0]
     meta_file = bin_file.replace('.bin', '.json')
     
@@ -186,7 +189,7 @@ def run_inference_phase(quantized_dir):
     target_meta = os.path.join(quantized_dir, meta_file)
     
     if not os.path.exists(target_meta):
-        print("❌ Metadata missing. Cannot dequantize.")
+        print("❌ Metadata missing.")
         return
 
     # Load Metadata
@@ -205,36 +208,41 @@ def run_inference_phase(quantized_dir):
         if HAS_CPP_EXT:
             device = get_device()
             
-            # Unpack (0-15 integers)
             a, b = quantization_cpp.unpack_int4(loaded_tensor)
             q_indices = torch.cat([a, b], dim=0).to(device).float()
             
-            # Remove padding if it was added
             if meta['padding'] > 0:
                 q_indices = q_indices[:-meta['padding']]
             
-            # [FIX] Mathematical Dequantization
-            # W ≈ scale * Q + min
             w_recon = q_indices * meta['scale'] + meta['min']
+            w_recon = w_recon.view(*meta['shape'])
             
-            # [FIX] Restore Shape
-            try:
-                w_recon = w_recon.view(*meta['shape'])
-                print(f"   Restored Matrix Shape: {list(w_recon.shape)}")
+            print(f"   Restored Matrix Shape: {list(w_recon.shape)}")
+            
+            # 3. Compute (Direction Aware)
+            # [FIX] Check layer type to perform correct Matrix Multiplication
+            if meta.get('is_conv1d', False):
+                # Conv1D weights are [In, Out]
+                # Forward Pass: Input(1, In) @ Weight(In, Out) -> Output(1, Out)
+                input_dim = w_recon.shape[0]
+                output_dim = w_recon.shape[1]
+                dummy_input = torch.randn(1, input_dim, device=device)
                 
-                # 3. Valid Matrix Multiplication
-                # Create input vector matching the last dimension of weights
-                input_dim = w_recon.shape[-1]
-                dummy_vec = torch.randn(input_dim, 1, device=device)
+                res = torch.matmul(dummy_input, w_recon)
+                print(f"   Mode: Conv1D (Input @ Weight)")
+            else:
+                # Linear weights are [Out, In]
+                # Forward Pass: Weight(Out, In) @ Input(In, 1) -> Output(Out, 1)
+                # (Or Input @ Weight.T)
+                input_dim = w_recon.shape[1]
+                output_dim = w_recon.shape[0]
+                dummy_input = torch.randn(input_dim, 1, device=device)
                 
-                # Perform MatMul (Weight @ Vector)
-                res = torch.matmul(w_recon, dummy_vec)
-                
-                print(f"🚀 Inference Computed on {device.upper()}")
-                print(f"   Output Shape: {list(res.shape)} | Mean Value: {res.mean().item():.4f}")
-                
-            except RuntimeError as e:
-                print(f"❌ Shape Mismatch during reconstruction: {e}")
+                res = torch.matmul(w_recon, dummy_input)
+                print(f"   Mode: Linear (Weight @ Input)")
+
+            print(f"🚀 Inference Computed on {device.upper()}")
+            print(f"   Output Shape: {list(res.shape)} | Mean Value: {res.mean().item():.4f}")
 
     finally:
         loader.close()
