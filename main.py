@@ -2,11 +2,13 @@ import os
 import time
 import shutil
 import argparse
+import json
+import struct
+import warnings
 import torch
 import torch.nn as nn
-import warnings
 
-# Suppress the specific mmap warning from PyTorch
+# Suppress specific mmap warning
 warnings.filterwarnings("ignore", message="The given buffer is not writable")
 
 from transformers import AutoModelForCausalLM, AutoConfig
@@ -22,7 +24,7 @@ except ImportError:
 from distributed.manual_ddp import BucketedDDP
 from inference.mmap_loader import ZeroCopyLoader
 
-# Import Triton Kernel (with error handling)
+# Import Triton Kernel
 try:
     from kernels.fused_mlp import fused_mlp
     HAS_TRITON = torch.cuda.is_available()
@@ -40,7 +42,6 @@ def print_header(msg):
 
 def setup_distributed():
     if not torch.distributed.is_initialized():
-        # Use localhost for single-node demo
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
         os.environ['RANK'] = '0'
@@ -49,7 +50,7 @@ def setup_distributed():
         torch.distributed.init_process_group(backend=backend)
 
 # -------------------------------------------------------------------------
-# Phase 1: GPU Fine-Tuning (With Triton)
+# Phase 1: GPU Fine-Tuning
 # -------------------------------------------------------------------------
 def run_training_phase(model_name):
     print_header(f"Phase 1: GPU Optimization & Training '{model_name}'")
@@ -65,47 +66,37 @@ def run_training_phase(model_name):
 
     print(f"✅ Model Loaded on {device.upper()}")
 
-    # 1. Apply Triton Kernels (Replacing PyTorch Layers)
     if HAS_TRITON and device == 'cuda':
         print("🚀 Injecting Triton Fused Kernels...")
-        # Demonstration of kernel execution
         dummy_input = torch.randn(32, 4096, device='cuda')
         dummy_bias = torch.randn(32, 4096, device='cuda')
-        
         start = time.time()
         _ = fused_mlp(dummy_input, dummy_bias)
         torch.cuda.synchronize()
         print(f"   Triton Fused MLP Time: {(time.time() - start)*1000:.3f} ms")
 
-    # 2. Distributed Wrapper
     setup_distributed()
     ddp_model = BucketedDDP(model, bucket_cap_mb=25)
     print("✅ Wrapped in BucketedDDP")
 
-    # 3. Training Step
     print("🔄 Running Backward Pass...")
     model.train()
     vocab_size = getattr(config, 'vocab_size', 32000)
     inputs = torch.randint(0, vocab_size, (1, 64)).to(device)
     
-    # [FIX] Pass 'labels' so the model calculates loss internally.
-    # Hugging Face models return None for loss if labels are missing.
     outputs = ddp_model(inputs, labels=inputs)
     
-    # [FIX] Robust check for loss existence
     if hasattr(outputs, 'loss') and outputs.loss is not None:
         loss = outputs.loss
     else:
-        # Fallback if specific model doesn't compute loss automatically
         loss = outputs.logits.mean()
 
     loss.backward()
-    
     print(f"✅ Gradients Synchronized. Loss: {loss.item():.4f}")
     return model
 
 # -------------------------------------------------------------------------
-# Phase 2: INT4 Quantization (CPU Offload)
+# Phase 2: INT4 Quantization (With Metadata)
 # -------------------------------------------------------------------------
 def run_quantization_phase(model):
     print_header("Phase 2: INT4 Quantization Pipeline")
@@ -121,43 +112,54 @@ def run_quantization_phase(model):
     print(f"📂 Saving to: ./{output_dir}/")
     layer_count = 0
     
-    # [FIX] GPT-2 uses 'Conv1D' layers, not just nn.Linear.
-    # We detect them by class name to avoid importing internal transformers modules.
     for i, (name, module) in enumerate(model.named_modules()):
         is_linear = isinstance(module, nn.Linear)
         is_conv1d = (module.__class__.__name__ == 'Conv1D')
         
         if is_linear or is_conv1d:
-            # Move to CPU to avoid CUDA OOM during quantization loop
             w = module.weight.data.detach().float().cpu()
+            original_shape = list(w.shape)
             
-            # [Optimization] Ensure even number of elements for packing (nibbles)
+            # Padding for odd-sized tensors
+            padding = 0
             if w.numel() % 2 != 0:
-                # Pad with one zero if odd (rare for standard layers)
+                padding = 1
                 w = torch.cat([w.view(-1), torch.zeros(1)])
             
-            # Quantize
+            # Quantization
             w_min, w_max = w.min(), w.max()
             scale = (w_max - w_min) / 15.0
+            if scale == 0: scale = 1.0 # Handle constant weights
+            
             w_int = ((w - w_min) / (scale + 1e-8)).round().clamp(0, 15).to(torch.uint8)
             
-            # Pack
+            # Packing
             mid = w_int.numel() // 2
             w_flat = w_int.view(-1)
-            
-            # Use C++ extension to pack 2 uint8s into 1 uint8
             packed = quantization_cpp.pack_int4(
                 w_flat[:mid].contiguous(), 
                 w_flat[mid:mid*2].contiguous()
             )
             
-            # Save
-            fname = os.path.join(output_dir, f"{name.replace('.', '_')}.bin")
-            with open(fname, "wb") as f:
+            # Save Binary
+            safe_name = name.replace('.', '_')
+            bin_path = os.path.join(output_dir, f"{safe_name}.bin")
+            with open(bin_path, "wb") as f:
                 f.write(packed.numpy().tobytes())
+
+            # [FIX] Save Metadata for reconstruction
+            meta_path = os.path.join(output_dir, f"{safe_name}.json")
+            metadata = {
+                "shape": original_shape,
+                "min": float(w_min),
+                "scale": float(scale),
+                "padding": padding
+            }
+            with open(meta_path, "w") as f:
+                json.dump(metadata, f)
             
             layer_count += 1
-            print(f"   🔹 Compressed {name} ({'Linear' if is_linear else 'Conv1D'})")
+            print(f"   🔹 Compressed {name}")
             
             if layer_count >= 5: 
                 print("   (Stopping at 5 layers for demo speed)")
@@ -166,40 +168,76 @@ def run_quantization_phase(model):
     return output_dir
 
 # -------------------------------------------------------------------------
-# Phase 3: Zero-Copy Load & Inference
+# Phase 3: Zero-Copy Inference (Correct Dequantization)
 # -------------------------------------------------------------------------
 def run_inference_phase(quantized_dir):
     print_header("Phase 3: Zero-Copy Inference (Virtual Memory)")
     
     if not quantized_dir: return
 
+    # Find first bin file
     files = [f for f in os.listdir(quantized_dir) if f.endswith('.bin')]
     if not files: return
-
-    target_file = os.path.join(quantized_dir, files[0])
-    file_size = os.path.getsize(target_file)
     
-    # 1. Load (Instant)
-    loader = ZeroCopyLoader(target_file)
-    # Map file to memory
-    loaded_tensor = loader.load_tensor(offset=0, shape=(file_size,), dtype=torch.uint8)
-    print(f"✅ Mapped File: {target_file} ({file_size/1024:.1f} KB)")
+    bin_file = files[0]
+    meta_file = bin_file.replace('.bin', '.json')
     
-    # 2. Unpack & Move to GPU
-    if HAS_CPP_EXT:
-        a, b = quantization_cpp.unpack_int4(loaded_tensor)
-        full = torch.cat([a, b], dim=0).to(get_device()).float()
-        
-        # 3. Compute
-        # [FIX] 'full' is a flattened 1D tensor here (metadata lost in demo).
-        # We use a dot product with a random vector of the SAME size to verify computation works.
-        # Previous code crashed because it assumed 2 dimensions.
-        dummy_vec = torch.randn(full.shape[0], device=get_device())
-        res = torch.dot(full, dummy_vec)
-        
-        print(f"🚀 Inference Computed on {get_device().upper()} (Result: {res.item():.2f})")
+    target_bin = os.path.join(quantized_dir, bin_file)
+    target_meta = os.path.join(quantized_dir, meta_file)
+    
+    if not os.path.exists(target_meta):
+        print("❌ Metadata missing. Cannot dequantize.")
+        return
 
-    loader.close()
+    # Load Metadata
+    with open(target_meta, 'r') as f:
+        meta = json.load(f)
+    
+    file_size = os.path.getsize(target_bin)
+    loader = ZeroCopyLoader(target_bin)
+    
+    try:
+        # 1. Map
+        loaded_tensor = loader.load_tensor(offset=0, shape=(file_size,), dtype=torch.uint8)
+        print(f"✅ Mapped File: {target_bin} ({file_size/1024:.1f} KB)")
+        
+        # 2. Unpack & Dequantize
+        if HAS_CPP_EXT:
+            device = get_device()
+            
+            # Unpack (0-15 integers)
+            a, b = quantization_cpp.unpack_int4(loaded_tensor)
+            q_indices = torch.cat([a, b], dim=0).to(device).float()
+            
+            # Remove padding if it was added
+            if meta['padding'] > 0:
+                q_indices = q_indices[:-meta['padding']]
+            
+            # [FIX] Mathematical Dequantization
+            # W ≈ scale * Q + min
+            w_recon = q_indices * meta['scale'] + meta['min']
+            
+            # [FIX] Restore Shape
+            try:
+                w_recon = w_recon.view(*meta['shape'])
+                print(f"   Restored Matrix Shape: {list(w_recon.shape)}")
+                
+                # 3. Valid Matrix Multiplication
+                # Create input vector matching the last dimension of weights
+                input_dim = w_recon.shape[-1]
+                dummy_vec = torch.randn(input_dim, 1, device=device)
+                
+                # Perform MatMul (Weight @ Vector)
+                res = torch.matmul(w_recon, dummy_vec)
+                
+                print(f"🚀 Inference Computed on {device.upper()}")
+                print(f"   Output Shape: {list(res.shape)} | Mean Value: {res.mean().item():.4f}")
+                
+            except RuntimeError as e:
+                print(f"❌ Shape Mismatch during reconstruction: {e}")
+
+    finally:
+        loader.close()
 
 # -------------------------------------------------------------------------
 # Main
@@ -217,7 +255,6 @@ if __name__ == "__main__":
         except EOFError:
             pass
 
-    # [FIX] Wrap in try...finally to ensure DDP cleanup happens even if code crashes
     try:
         model = run_training_phase(model_name)
         if model:
