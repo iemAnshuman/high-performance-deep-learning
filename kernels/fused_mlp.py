@@ -43,8 +43,13 @@ def fused_mlp_kernel(
     accum_cubed = accum * accum * accum
     inner = 0.7978845608 * (accum + 0.044715 * accum_cubed)
     
-    # FIX: Use tl.math.tanh instead of tl.tanh
-    output = 0.5 * accum * (1.0 + tl.math.tanh(inner))
+    # ROBUST TANH IMPLEMENTATION
+    # tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    # This works on ALL Triton versions (tl.exp is always available)
+    exp_2x = tl.exp(2.0 * inner)
+    tanh_val = (exp_2x - 1.0) / (exp_2x + 1.0)
+    
+    output = 0.5 * accum * (1.0 + tanh_val)
     
     # 3. Store result
     tl.store(out_ptr + offsets, output, mask=mask)
