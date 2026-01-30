@@ -1,74 +1,101 @@
-import os
+import torch
 import mmap
+import os
 import time
-import struct
+import contextlib
 
 class ZeroCopyLoader:
     """
-    A utility to load massive model weights instantly using OS-level memory mapping.
+    Real Zero-Copy Loader using torch.frombuffer.
     
-    Standard Load: Disk -> CPU RAM -> (Copy) -> Tensor
-    Zero-Copy:     Disk -> (Virtual Map) -> Tensor
-    
-    This reduces start-up time for large models from minutes to seconds.
+    This allows loading models larger than RAM by leveraging the OS page cache.
+    The tensor is created instantly; data is faulted in by the OS on access.
     """
     def __init__(self, filename):
         self.filename = filename
         if not os.path.exists(filename):
             raise FileNotFoundError(f"Model file {filename} not found.")
+            
+        # Keep file open as long as the mmap is active
+        self._file_handle = open(self.filename, "r+b")
+        
+        # Create the memory map
+        # PROT_READ means the OS ensures we don't accidentally overwrite weights
+        self.mm = mmap.mmap(self._file_handle.fileno(), 0, access=mmap.ACCESS_READ)
 
-    def load_tensor(self, offset, shape, dtype='float32'):
+    def load_tensor(self, offset, shape, dtype=torch.float32):
         """
-        Maps a specific chunk of the file to a tensor without reading the whole file.
+        Returns a torch.Tensor view of the file without copying bytes to userspace RAM.
         """
-        # Calculate size in bytes
-        # float32 = 4 bytes
-        element_size = 4 if dtype == 'float32' else 2 
-        num_elements = 1
+        # 1. Calculate size
+        numel = 1
         for dim in shape:
-            num_elements *= dim
-        
-        total_bytes = num_elements * element_size
-        
-        print(f"[Loader] Mapping {total_bytes / 1e6:.2f} MB from offset {offset}...")
-        
-        start_time = time.time()
-        
-        with open(self.filename, "r+b") as f:
-            # mmap.MAP_SHARED means changes are written back to disk (useful for training)
-            # mmap.PROT_READ means we only want to read (inference safety)
-            # Note: Windows requires access=mmap.ACCESS_READ
+            numel *= dim
             
-            mm = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
-            
-            # In a real library (like numpy or torch), we can create an array 
-            # directly on top of this memory buffer without copying.
-            # Here, we simulate the 'access' which triggers the OS page fault (load).
-            
-            # Simulate "touching" the data
-            _ = mm[offset : offset + 100]
-            
-            mm.close()
-            
-        print(f"[Loader] Instant Load Time: {time.time() - start_time:.6f}s")
+        # 2. Create the Tensor View
+        # torch.frombuffer creates a tensor that shares memory with the python object (self.mm)
+        # No memory copy happens here. It's just pointer arithmetic.
+        try:
+            flat_tensor = torch.frombuffer(
+                self.mm, 
+                dtype=dtype, 
+                count=numel, 
+                offset=offset
+            )
+        except Exception as e:
+            print(f"[Error] Failed to map tensor: {e}")
+            return None
+
+        # 3. Reshape (View)
+        return flat_tensor.view(shape)
+
+    def close(self):
+        """Clean up file handles"""
+        if hasattr(self, 'mm') and not self.mm.closed:
+            self.mm.close()
+        if hasattr(self, '_file_handle') and not self._file_handle.closed:
+            self._file_handle.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 # Usage Simulation
 if __name__ == "__main__":
-    # 1. Create a dummy large file (1GB) to simulate a model weight
+    # 1. Generate a dummy 1GB file
     dummy_file = "large_model.bin"
+    size_in_floats = 256 * 1024 * 1024 # 1GB of float32
     
-    # Only create if it doesn't exist (save time)
     if not os.path.exists(dummy_file):
-        print("Generating dummy model file (1GB)... this may take a second.")
+        print("Generating 1GB dummy file...")
         with open(dummy_file, "wb") as f:
-            f.seek(1024 * 1024 * 1000 - 1) # Seek to 1GB
+            f.seek((size_in_floats * 4) - 1)
             f.write(b'\0')
+
+    print("--- Testing Zero-Copy Load ---")
     
-    loader = ZeroCopyLoader(dummy_file)
-    
-    # 2. "Load" a layer (e.g., Llama Attention Weight)
-    # We aren't actually reading 1GB, we are just mapping the pointer.
-    loader.load_tensor(offset=0, shape=(4096, 4096))
-    
+    # 2. The "Instant" Load
+    t0 = time.time()
+    with ZeroCopyLoader(dummy_file) as loader:
+        # Map a chunk in the middle of the file
+        # This returns a real PyTorch tensor
+        tensor = loader.load_tensor(offset=1024, shape=(4096, 4096), dtype=torch.float32)
+        
+        load_time = time.time() - t0
+        print(f"Load Time: {load_time*1000:.3f} ms (Should be < 1ms)")
+        
+        # 3. Prove it's usable
+        print(f"Tensor Device: {tensor.device}")
+        print(f"Tensor Shape:  {tensor.shape}")
+        
+        # 4. Trigger the Page Fault (The actual read from disk happens here)
+        t1 = time.time()
+        s = torch.sum(tensor) 
+        access_time = time.time() - t1
+        print(f"Access Time: {access_time*1000:.3f} ms (Disk I/O happened here)")
+
     # Cleanup
-    # os.remove(dummy_file)
+    if os.path.exists(dummy_file):
+        os.remove(dummy_file)
