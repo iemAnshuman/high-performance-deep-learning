@@ -1,6 +1,6 @@
 # High-Performance Deep Learning Kernels (HPC-DL)
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green)
 ![Triton](https://img.shields.io/badge/triton-2.1.0-orange)
 ![CUDA](https://img.shields.io/badge/CUDA-12.1-green)
